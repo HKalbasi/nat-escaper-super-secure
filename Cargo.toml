@@ -6,4 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.99"
 clap = { version = "4.5.47", features = ["derive"] }
+exec = "0.3.1"
 tokio = { version = "1.47.1", features = ["full"] }
+tokio-stream-multiplexor = "0.5.6"
+tokio-util = { version = "0.7.16", features = ["rt"] }

@@ -1,39 +1,48 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
+use tokio::io::copy_bidirectional;
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
+use tokio_stream_multiplexor::StreamMultiplexorConfig;
 
 use crate::TARGET_URL;
 
 pub async fn run() -> anyhow::Result<()> {
     let listener = TcpListener::bind(TARGET_URL).await?;
-    println!("Echo server listening on {TARGET_URL}");
+    println!("Server listening on {TARGET_URL}");
 
-    loop {
-        let (mut socket, addr) = listener.accept().await?;
-        println!("New connection from: {}", addr);
+    let (socket, addr) = listener.accept().await?;
+    println!("New connection from: {}", addr);
 
-        tokio::spawn(async move {
-            let mut buf = [0; 1024];
+    let socket = Arc::new(tokio_stream_multiplexor::StreamMultiplexor::new(
+        socket,
+        StreamMultiplexorConfig::default(),
+    ));
+
+    let mut task_tracker = JoinSet::new();
+
+    for port in [8000, 8082] {
+        let socket = socket.clone();
+        task_tracker.spawn(async move {
+            let listener = TcpListener::bind(("127.0.0.1", port)).await?;
 
             loop {
-                match socket.read(&mut buf).await {
-                    Ok(0) => {
-                        // Connection closed
-                        println!("Connection closed by: {}", addr);
-                        break;
+                let (mut up_socket, _) = listener.accept().await?;
+                let mut down_socket = socket.connect(port).await?;
+                tokio::spawn(async move {
+                    if let Err(e) = copy_bidirectional(&mut up_socket, &mut down_socket).await {
+                        println!("{e}");
                     }
-                    Ok(n) => {
-                        // Echo the data back
-                        if let Err(e) = socket.write_all(&buf[0..n]).await {
-                            eprintln!("Failed to write to socket: {}", e);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to read from socket: {}", e);
-                        break;
-                    }
-                }
+                });
             }
+
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
         });
     }
+
+    while let Some(res) = task_tracker.join_next().await {
+        res??;
+    }
+
+    Ok(())
 }

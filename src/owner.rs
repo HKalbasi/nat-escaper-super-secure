@@ -1,6 +1,10 @@
+use std::sync::Arc;
+
 use anyhow::{Context, bail};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::TcpStream;
+use tokio::task::JoinSet;
+use tokio_stream_multiplexor::StreamMultiplexorConfig;
 
 use crate::TARGET_URL;
 
@@ -31,6 +35,8 @@ async fn connect_via_proxy(proxy_addr: &str, target_addr: &str) -> anyhow::Resul
 
     // 4. Check if connection was successful
     let response_str = String::from_utf8_lossy(&response);
+    println!("Received from proxy: {response_str}");
+
     if !response_str.starts_with("HTTP/1.1 200") && !response_str.starts_with("HTTP/1.0 200") {
         bail!("Proxy connection failed: {}", response_str);
     }
@@ -47,28 +53,37 @@ pub async fn run() -> anyhow::Result<()> {
     let target = TARGET_URL; // Can be any TCP service!
 
     // Get the tunneled connection
-    let mut stream = connect_via_proxy(&proxy, target).await?;
+    let stream = connect_via_proxy(&proxy, target).await?;
 
-    // Now use it like a regular TCP connection!
-    // For HTTP:
-    let http_request = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
-    stream.write_all(http_request.as_bytes()).await?;
+    let listener = Arc::new(tokio_stream_multiplexor::StreamMultiplexor::new(
+        stream,
+        StreamMultiplexorConfig::default(),
+    ));
 
-    // For raw TCP (any protocol):
-    let custom_data = b"Your custom protocol data here";
-    stream.write_all(custom_data).await?;
+    let mut task_tracker = JoinSet::new();
 
-    // Read response
-    let mut response = Vec::new();
-    let mut buffer = [0u8; 1024];
-    loop {
-        let n = stream.read(&mut buffer).await?;
-        if n == 0 {
-            break;
-        }
-        response.extend_from_slice(&buffer[..n]);
+    for port in [8000, 8082] {
+        let listener = listener.clone();
+        task_tracker.spawn(async move {
+            let listener = listener.bind(port).await?;
+            loop {
+                let mut up_socket = listener.accept().await?;
+                let mut down_socket = TcpStream::connect(("127.0.0.1", port)).await?;
+                tokio::spawn(async move {
+                    if let Err(e) = copy_bidirectional(&mut up_socket, &mut down_socket).await {
+                        println!("{e}");
+                    }
+                });
+            }
+
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        });
     }
 
-    println!("Received: {}", String::from_utf8_lossy(&response));
+    while let Some(res) = task_tracker.join_next().await {
+        res??;
+    }
+
     Ok(())
 }
